@@ -1,0 +1,576 @@
+# app.R - fsQCA Shiny App (Optimized for Speed)
+# 
+# Author: Dr. M.I.M. Riyath
+# Department of Accountancy and Finance
+# Faculty of Management and Commerce
+# South Eastern University of Sri Lanka, Sri Lanka
+# Email: riyath@seu.ac.lk
+#
+# Version: 1.0
+# Last Updated: December 2025
+
+library(shiny)
+library(readxl)
+library(QCA)
+library(dplyr)
+library(DT)
+library(shinythemes)
+
+# ---------- helper functions ------------------------------------------------
+
+norm01 <- function(x) {
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+}
+
+get_thresholds <- function(x, method = c("quartile", "quintile", "percentile"),
+                           p_low = 10, p_mid = 50, p_high = 90) {
+  method <- match.arg(method)
+  probs <- switch(method,
+                  quartile = c(0.25, 0.50, 0.75),
+                  quintile = c(0.20, 0.50, 0.80),
+                  percentile = c(p_low, p_mid, p_high) / 100
+  )
+  as.numeric(quantile(x, probs = probs, na.rm = TRUE))
+}
+
+get_all_configurations <- function(sol) {
+  if (is.null(sol)) return(character(0))
+  s <- sol$solution
+  if (is.null(s)) s <- sol$solutions
+  if (is.null(s)) return(character(0))
+  
+  all_terms <- character(0)
+  if (is.list(s)) {
+    for (block in s) {
+      if (is.character(block)) {
+        for (term in block) {
+          if (nzchar(term)) {
+            if (grepl("\\+", term)) {
+              parts <- unlist(strsplit(term, "\\s*\\+\\s*"))
+              all_terms <- c(all_terms, trimws(parts))
+            } else {
+              all_terms <- c(all_terms, trimws(term))
+            }
+          }
+        }
+      }
+    }
+  } else if (is.character(s)) {
+    for (term in s) {
+      if (nzchar(term)) {
+        if (grepl("\\+", term)) {
+          parts <- unlist(strsplit(term, "\\s*\\+\\s*"))
+          all_terms <- c(all_terms, trimws(parts))
+        } else {
+          all_terms <- c(all_terms, trimws(term))
+        }
+      }
+    }
+  }
+  unique(all_terms)
+}
+
+term_membership <- function(term, data) {
+  lits <- unlist(strsplit(gsub("\\s+", "", term), "\\*"))
+  lits <- lits[nzchar(lits)]
+  if (length(lits) == 0) return(rep(NA_real_, nrow(data)))
+  
+  mems <- lapply(lits, function(lit) {
+    if (startsWith(lit, "~")) {
+      v <- substring(lit, 2)
+      if (v %in% names(data)) 1 - as.numeric(data[[v]]) else rep(NA_real_, nrow(data))
+    } else {
+      if (lit %in% names(data)) as.numeric(data[[lit]]) else rep(NA_real_, nrow(data))
+    }
+  })
+  Reduce(pmin, mems)
+}
+
+compute_term_stats <- function(terms, data, outcome) {
+  if (length(terms) == 0) return(NULL)
+  Y <- as.numeric(data[[outcome]])
+  denomY <- sum(Y, na.rm = TRUE)
+  Xlist <- lapply(terms, term_membership, data = data)
+  
+  out <- lapply(seq_along(terms), function(i) {
+    Xi <- Xlist[[i]]
+    other <- if (length(terms) == 1) rep(0, length(Xi)) else Reduce(pmax, Xlist[-i])
+    numXY <- sum(pmin(Xi, Y), na.rm = TRUE)
+    denomX <- sum(Xi, na.rm = TRUE)
+    
+    data.frame(
+      Configuration = terms[i],
+      covS = ifelse(denomY == 0, NA_real_, numXY / denomY),
+      covU = ifelse(denomY == 0, NA_real_, sum(pmin(pmin(Xi, Y), 1 - other), na.rm = TRUE) / denomY),
+      inclS = ifelse(denomX == 0, NA_real_, numXY / denomX),
+      stringsAsFactors = FALSE
+    )
+  })
+  do.call(rbind, out)
+}
+
+compute_solution_cov_cons <- function(terms, data, outcome) {
+  if (length(terms) == 0) return(c(NA_real_, NA_real_))
+  Y <- as.numeric(data[[outcome]])
+  denomY <- sum(Y, na.rm = TRUE)
+  Xlist <- lapply(terms, term_membership, data = data)
+  SOP <- Reduce(pmax, Xlist)
+  num <- sum(pmin(SOP, Y), na.rm = TRUE)
+  c(ifelse(denomY == 0, NA_real_, num / denomY),
+    ifelse(sum(SOP, na.rm = TRUE) == 0, NA_real_, num / sum(SOP, na.rm = TRUE)))
+}
+
+format_solution_fsqca <- function(sol, type_label, ncut, inclcut,
+                                  file_label, model_label, data, outcome,
+                                  assumptions_text = NULL) {
+  terms <- get_all_configurations(sol)
+  if (length(terms) == 0) { cat("No configurations found.\n"); return(invisible(NULL)) }
+  
+  ts <- compute_term_stats(terms, data = data, outcome = outcome)
+  cc <- compute_solution_cov_cons(terms, data = data, outcome = outcome)
+  
+  cat("**********************\n")
+  cat("*TRUTH TABLE ANALYSIS*\n")
+  cat("**********************\n\n")
+  if (!is.null(file_label) && nzchar(file_label)) cat("File: ", file_label, "\n", sep = "")
+  if (!is.null(model_label) && nzchar(model_label)) cat("Model: ", model_label, "\n", sep = "")
+  cat("Algorithm: Quine-McCluskey\n\n")
+  cat("--- ", toupper(type_label), " SOLUTION ---\n", sep = "")
+  cat("frequency cutoff: ", ncut, "\n", sep = "")
+  cat("consistency cutoff: ", inclcut, "\n", sep = "")
+  if (!is.null(assumptions_text) && nzchar(assumptions_text)) {
+    cat("Assumptions:\n", assumptions_text, "\n", sep = "")
+  }
+  cat("                                                        raw       unique              \n")
+  cat("                                                      coverage    coverage   consistency \n")
+  cat("                                                     ----------  ----------  ----------\n")
+  for (i in seq_len(nrow(ts))) {
+    cat(sprintf("%-52s %10.7f %11.7f %11.6f\n", ts$Configuration[i], ts$covS[i], ts$covU[i], ts$inclS[i]))
+  }
+  cat("solution coverage: ", sprintf("%.6f", cc[1]), "\n", sep = "")
+  cat("solution consistency: ", sprintf("%.6f", cc[2]), "\n\n", sep = "")
+}
+
+# ---------- UI --------------------------------------------------------------
+
+ui <- fluidPage(
+  theme = shinytheme("flatly"),
+  
+  # Add custom CSS for footer
+  tags$head(
+    tags$style(HTML("
+      .app-footer {
+        position: fixed;
+        bottom: 0;
+        width: 100%;
+        background-color: #2c3e50;
+        color: white;
+        text-align: center;
+        padding: 10px 0;
+        font-size: 12px;
+        z-index: 1000;
+        box-shadow: 0 -2px 5px rgba(0,0,0,0.1);
+      }
+      .app-footer a {
+        color: #3498db;
+        text-decoration: none;
+      }
+      .app-footer a:hover {
+        color: #5dade2;
+        text-decoration: underline;
+      }
+      .main-content {
+        padding-bottom: 60px;
+      }
+    "))
+  ),
+  
+  div(class = "main-content",
+    titlePanel("fsQCA Analysis Tool"),
+    
+    sidebarLayout(
+      sidebarPanel(
+        width = 3,
+        fileInput("file", "Upload Excel (.xlsx/.xls)", accept = c(".xlsx", ".xls")),
+        actionButton("selectVars", "Select Variables", class = "btn-info btn-block"),
+        verbatimTextOutput("selectedVarsSummary"),
+        hr(),
+        radioButtons("calMethod", "Calibration:",
+                     choices = c("Quartile (25/50/75)" = "quartile",
+                                 "Quintile (20/50/80)" = "quintile",
+                                 "Custom Percentiles" = "percentile"),
+                     selected = "quartile"),
+        conditionalPanel("input.calMethod == 'percentile'",
+                         numericInput("p_low", "Low %", 5, 0, 50),
+                         numericInput("p_mid", "Mid %", 50, 0, 100),
+                         numericInput("p_high", "High %", 95, 50, 100)
+        ),
+        hr(),
+        numericInput("ncut", "Frequency cutoff", value = 1, min = 1, step = 1),
+        numericInput("inclcut", "Consistency cutoff", value = 0.80, min = 0, max = 1, step = 0.01),
+        hr(),
+        actionButton("runCalibrate", "1. Calibrate", class = "btn-success btn-block"),
+        actionButton("runTruthTable", "2. Truth Table", class = "btn-warning btn-block"),
+        actionButton("specifyAnalysis", "3. Specify Analysis", class = "btn-info btn-block"),
+        actionButton("runMinimize", "4. Minimize", class = "btn-primary btn-block"),
+        hr(),
+        downloadButton("downReport", "Download Report")
+      ),
+      
+      mainPanel(
+        width = 9,
+        tabsetPanel(
+          id = "mainTabs",
+          tabPanel("Raw Data", DTOutput("rawPreview")),
+          tabPanel("Calibration", DTOutput("calSummary")),
+          tabPanel("Calibrated Data", DTOutput("calibratedPreview")),
+          tabPanel("Truth Table", DTOutput("ttEditable")),
+          tabPanel("Complex Solution", verbatimTextOutput("complexOut")),
+          tabPanel("Parsimonious Solution", verbatimTextOutput("parsOut")),
+          tabPanel("Intermediate Solution", verbatimTextOutput("intOut")),
+          tabPanel("Summary", DTOutput("solutionSummary"), hr(), DTOutput("bestConfigs"))
+        )
+      )
+    )
+  ),
+  
+  # Footer with author information
+  div(class = "app-footer",
+    HTML("Developed by <strong>Dr. M.I.M. Riyath</strong> | 
+         Department of Accountancy and Finance, Faculty of Management and Commerce, 
+         South Eastern University of Sri Lanka | 
+         <a href='mailto:riyath@seu.ac.lk'>riyath@seu.ac.lk</a>")
+  )
+)
+
+# ---------- SERVER ----------------------------------------------------------
+
+server <- function(input, output, session) {
+  
+  rv <- reactiveValues(
+    raw_data = NULL, outcome_var = NULL, outcome_negated = FALSE,
+    condition_vars = NULL, negated_conditions = NULL,
+    df_cal = NULL, thresholds = NULL, tt = NULL, tt_edited = NULL,
+    sol_complex = NULL, sol_pars = NULL, sol_int = NULL, file_label = NULL,
+    # Specify Analysis (defaults: Complex-style - fast)
+    pos_case = "true", neg_case = "false", dc_case = "false", remainder = "false",
+    # Directional expectations (default: no expectation = fastest)
+    dir_exp = NULL
+  )
+  
+  build_model_label <- function() {
+    out <- if (!is.null(rv$outcome_var)) {
+      if (rv$outcome_negated) paste0("~", rv$outcome_var) else rv$outcome_var
+    } else "OUT"
+    conds <- rv$condition_vars
+    if (is.null(conds) || length(conds) == 0) return(out)
+    paste0(out, " = f(", paste(conds, collapse = ", "), ")")
+  }
+  
+  # File upload
+  observeEvent(input$file, {
+    req(input$file)
+    tryCatch({
+      rv$raw_data <- read_excel(input$file$datapath) %>% as.data.frame()
+      rv$file_label <- input$file$name
+      showNotification("Loaded!", type = "message")
+    }, error = function(e) showNotification(paste("Error:", e$message), type = "error"))
+  })
+  
+  output$rawPreview <- renderDT({
+    req(rv$raw_data)
+    datatable(rv$raw_data, options = list(scrollX = TRUE, pageLength = 10))
+  })
+  
+  # Variable selection modal
+  observeEvent(input$selectVars, {
+    req(rv$raw_data)
+    showModal(modalDialog(
+      title = "Select Variables", size = "l",
+      fluidRow(
+        column(4,
+               h4("Available"), selectInput("availableVars", NULL, choices = names(rv$raw_data), multiple = TRUE, size = 12, selectize = FALSE),
+               actionButton("addToConds", "Add →", class = "btn-success btn-sm")
+        ),
+        column(4,
+               h4("Outcome"),
+               textInput("outcomeDisplay", NULL, value = if(!is.null(rv$outcome_var)) rv$outcome_var else "", placeholder = "Select & Set"),
+               actionButton("setOutcome", "Set", class = "btn-warning btn-sm"),
+               actionButton("setOutcomeNeg", "Set ~", class = "btn-warning btn-sm")
+        ),
+        column(4,
+               h4("Conditions"), selectInput("conditionDisplay", NULL, choices = rv$condition_vars, multiple = TRUE, size = 12, selectize = FALSE),
+               actionButton("removeFromConds", "← Remove", class = "btn-danger btn-sm")
+        )
+      ),
+      footer = tagList(modalButton("Cancel"), actionButton("okVars", "OK", class = "btn-primary"))
+    ))
+  })
+  
+  observeEvent(input$setOutcome, { req(input$availableVars); rv$outcome_var <- input$availableVars[1]; rv$outcome_negated <- FALSE; updateTextInput(session, "outcomeDisplay", value = rv$outcome_var) })
+  observeEvent(input$setOutcomeNeg, { req(input$availableVars); rv$outcome_var <- input$availableVars[1]; rv$outcome_negated <- TRUE; updateTextInput(session, "outcomeDisplay", value = paste0("~", rv$outcome_var)) })
+  observeEvent(input$addToConds, { req(input$availableVars); rv$condition_vars <- setdiff(unique(c(rv$condition_vars, input$availableVars)), rv$outcome_var); updateSelectInput(session, "conditionDisplay", choices = rv$condition_vars) })
+  observeEvent(input$removeFromConds, { req(input$conditionDisplay); rv$condition_vars <- setdiff(rv$condition_vars, input$conditionDisplay); updateSelectInput(session, "conditionDisplay", choices = rv$condition_vars) })
+  observeEvent(input$okVars, {
+    req(rv$outcome_var, rv$condition_vars)
+    rv$dir_exp <- setNames(rep("pa", length(rv$condition_vars)), rv$condition_vars)
+    removeModal()
+    showNotification("Variables set!", type = "message")
+  })
+  
+  output$selectedVarsSummary <- renderText({
+    out_txt <- if (!is.null(rv$outcome_var)) { if (rv$outcome_negated) paste0("~", rv$outcome_var) else rv$outcome_var } else "None"
+    cond_txt <- if (length(rv$condition_vars) > 0) paste(rv$condition_vars, collapse = ", ") else "None"
+    paste0("Outcome: ", out_txt, "\nConditions: ", cond_txt)
+  })
+  
+  # Calibration
+  observeEvent(input$runCalibrate, {
+    req(rv$raw_data, rv$outcome_var, rv$condition_vars)
+    tryCatch({
+      all_vars <- c(rv$outcome_var, rv$condition_vars)
+      df <- rv$raw_data[, all_vars, drop = FALSE]
+      df_norm <- as.data.frame(lapply(df, norm01))
+      
+      thr_list <- lapply(df_norm, get_thresholds, method = input$calMethod,
+                         p_low = if(input$calMethod == "percentile") input$p_low else 10,
+                         p_mid = if(input$calMethod == "percentile") input$p_mid else 50,
+                         p_high = if(input$calMethod == "percentile") input$p_high else 90)
+      
+      rv$thresholds <- data.frame(
+        Variable = names(df_norm),
+        FullNon = sapply(thr_list, `[[`, 1),
+        Crossover = sapply(thr_list, `[[`, 2),
+        FullMem = sapply(thr_list, `[[`, 3),
+        stringsAsFactors = FALSE
+      )
+      
+      df_cal <- df_norm
+      for (v in names(df_norm)) df_cal[[v]] <- calibrate(df_norm[[v]], type = "fuzzy", thresholds = thr_list[[v]])
+      if (rv$outcome_negated) df_cal[[rv$outcome_var]] <- 1 - df_cal[[rv$outcome_var]]
+      for (v in rv$negated_conditions) if (v %in% names(df_cal)) df_cal[[v]] <- 1 - df_cal[[v]]
+      
+      rv$df_cal <- df_cal
+      showNotification("Calibrated!", type = "message")
+      updateTabsetPanel(session, "mainTabs", selected = "Calibration")
+    }, error = function(e) showNotification(paste("Error:", e$message), type = "error"))
+  })
+  
+  output$calSummary <- renderDT({ req(rv$thresholds); datatable(rv$thresholds) %>% formatRound(2:4, 4) })
+  output$calibratedPreview <- renderDT({ req(rv$df_cal); datatable(rv$df_cal, options = list(scrollX = TRUE, pageLength = 10)) %>% formatRound(1:ncol(rv$df_cal), 4) })
+  
+  # Truth Table
+  observeEvent(input$runTruthTable, {
+    req(rv$df_cal, rv$outcome_var, rv$condition_vars)
+    tryCatch({
+      rv$tt <- truthTable(rv$df_cal, outcome = rv$outcome_var, conditions = rv$condition_vars,
+                          n.cut = input$ncut, incl.cut = input$inclcut, show.cases = TRUE, PRI = TRUE)
+      rv$tt_edited <- as.data.frame(rv$tt$tt)
+      showNotification("Truth table ready!", type = "message")
+      updateTabsetPanel(session, "mainTabs", selected = "Truth Table")
+    }, error = function(e) showNotification(paste("Error:", e$message), type = "error"))
+  })
+  
+  output$ttEditable <- renderDT({
+    req(rv$tt_edited)
+    cols <- c(rv$condition_vars, "n", "OUT", "incl", "PRI")
+    cols <- cols[cols %in% names(rv$tt_edited)]
+    datatable(rv$tt_edited[, cols], editable = list(target = "cell", disable = list(columns = which(cols != "OUT") - 1)),
+              options = list(scrollX = TRUE, pageLength = 20)) %>% formatRound(c("incl", "PRI"), 6)
+  })
+  
+  observeEvent(input$ttEditable_cell_edit, {
+    info <- input$ttEditable_cell_edit
+    cols <- c(rv$condition_vars, "n", "OUT", "incl", "PRI")
+    cols <- cols[cols %in% names(rv$tt_edited)]
+    if (cols[info$col + 1] == "OUT" && info$value %in% c("0", "1", "C", "?")) {
+      rv$tt_edited[info$row, "OUT"] <- info$value
+      rv$tt$tt$OUT <- rv$tt_edited$OUT
+    }
+  })
+  
+  # Specify Analysis Modal (FIXED - proper mutual exclusivity)
+  observeEvent(input$specifyAnalysis, {
+    req(rv$tt)
+    showModal(modalDialog(
+      title = "Specify Analysis", size = "l",
+      p("Select configurations to minimize, constrain, or treat as don't cares."),
+      
+      tags$table(class = "table table-condensed", style = "width: auto;",
+                 tags$thead(
+                   tags$tr(tags$th(""), tags$th("True"), tags$th("False"), tags$th("Don't Cares"))
+                 ),
+                 tags$tbody(
+                   tags$tr(
+                     tags$td("Positive Cases (1)"),
+                     tags$td(colspan = "3", radioButtons("pos_case", NULL, choices = c("True" = "true", "False" = "false", "Don't Cares" = "dc"), selected = rv$pos_case, inline = TRUE))
+                   ),
+                   tags$tr(
+                     tags$td("Negative Cases (0)"),
+                     tags$td(colspan = "3", radioButtons("neg_case", NULL, choices = c("True" = "true", "False" = "false", "Don't Cares" = "dc"), selected = rv$neg_case, inline = TRUE))
+                   ),
+                   tags$tr(
+                     tags$td("Don't Care Cases (-)"),
+                     tags$td(colspan = "3", radioButtons("dc_case", NULL, choices = c("True" = "true", "False" = "false", "Don't Cares" = "dc"), selected = rv$dc_case, inline = TRUE))
+                   ),
+                   tags$tr(
+                     tags$td("Remainders"),
+                     tags$td(colspan = "3", radioButtons("remainder", NULL, choices = c("True" = "true", "False" = "false", "Don't Cares" = "dc"), selected = rv$remainder, inline = TRUE))
+                   )
+                 )
+      ),
+      
+      hr(),
+      h4("Intermediate: Directional Expectations"),
+      p("Should contribute to ", strong(rv$outcome_var), " when cause is:"),
+      uiOutput("dirExpUI"),
+      footer = tagList(modalButton("Cancel"), actionButton("okSpecify", "OK", class = "btn-primary"))
+    ))
+  })
+  
+  output$dirExpUI <- renderUI({
+    req(rv$condition_vars)
+    lapply(rv$condition_vars, function(cond) {
+      curr <- if (!is.null(rv$dir_exp[[cond]])) rv$dir_exp[[cond]] else "pa"
+      fluidRow(
+        column(3, strong(cond)),
+        column(9, radioButtons(paste0("dir_", cond), NULL,
+                               choices = c("Present" = "p", "Absent" = "a", "Present or Absent" = "pa"),
+                               selected = curr, inline = TRUE))
+      )
+    })
+  })
+  
+  observeEvent(input$okSpecify, {
+    rv$pos_case <- input$pos_case
+    rv$neg_case <- input$neg_case
+    rv$dc_case <- input$dc_case
+    rv$remainder <- input$remainder
+    for (cond in rv$condition_vars) {
+      val <- input[[paste0("dir_", cond)]]
+      if (!is.null(val)) rv$dir_exp[[cond]] <- val
+    }
+    removeModal()
+    showNotification("Settings saved!", type = "message")
+  })
+  
+  # Minimization (OPTIMIZED based on Specify Analysis settings)
+  observeEvent(input$runMinimize, {
+    req(rv$tt, rv$df_cal, rv$outcome_var, rv$condition_vars)
+    
+    tryCatch({
+      withProgress(message = "Minimizing...", value = 0, {
+        
+        # SPEED OPTIMIZATION: Use settings to control include parameter
+        # remainder = "false" → include = "" (no remainders, fastest)
+        # remainder = "true" or "dc" → include = "?" (use remainders)
+        include_complex <- ""
+        include_other <- if (rv$remainder == "false") "" else "?"
+        
+        # SPEED OPTIMIZATION: Only build dir.exp if user specified directions
+        dir_exp_vec <- sapply(rv$condition_vars, function(cond) {
+          val <- rv$dir_exp[[cond]]
+          if (is.null(val) || val == "pa") 0 else if (val == "p") 1 else -1
+        })
+        has_dir_exp <- any(dir_exp_vec != 0)
+        
+        # SPEED OPTIMIZATION: details = FALSE, show.cases = FALSE
+        incProgress(0.3, detail = "Complex...")
+        rv$sol_complex <- tryCatch(
+          minimize(rv$tt, include = include_complex, details = FALSE, show.cases = FALSE),
+          error = function(e) NULL
+        )
+        
+        incProgress(0.6, detail = "Parsimonious...")
+        rv$sol_pars <- tryCatch(
+          minimize(rv$tt, include = include_other, details = FALSE, show.cases = FALSE),
+          error = function(e) NULL
+        )
+        
+        incProgress(0.9, detail = "Intermediate...")
+        if (has_dir_exp && include_other == "?") {
+          rv$sol_int <- tryCatch(
+            minimize(rv$tt, include = "?", dir.exp = dir_exp_vec, details = FALSE, show.cases = FALSE),
+            error = function(e) NULL
+          )
+        } else {
+          # No directional expectations = same as complex (fastest path)
+          rv$sol_int <- rv$sol_complex
+        }
+        
+        incProgress(1.0)
+      })
+      showNotification("Done!", type = "message")
+      updateTabsetPanel(session, "mainTabs", selected = "Complex Solution")
+    }, error = function(e) showNotification(paste("Error:", e$message), type = "error"))
+  })
+  
+  # Solution outputs
+  output$complexOut <- renderPrint({
+    req(rv$sol_complex, rv$df_cal, rv$outcome_var)
+    format_solution_fsqca(rv$sol_complex, "COMPLEX", input$ncut, input$inclcut, rv$file_label, build_model_label(), rv$df_cal, rv$outcome_var)
+  })
+  
+  output$parsOut <- renderPrint({
+    req(rv$sol_pars, rv$df_cal, rv$outcome_var)
+    format_solution_fsqca(rv$sol_pars, "PARSIMONIOUS", input$ncut, input$inclcut, rv$file_label, build_model_label(), rv$df_cal, rv$outcome_var)
+  })
+  
+  output$intOut <- renderPrint({
+    req(rv$sol_int, rv$df_cal, rv$outcome_var)
+    assumptions <- paste(sapply(rv$condition_vars, function(c) {
+      v <- rv$dir_exp[[c]]; paste0(c, ": ", if(is.null(v)||v=="pa") "Present or Absent" else if(v=="p") "Present" else "Absent")
+    }), collapse = ", ")
+    format_solution_fsqca(rv$sol_int, "INTERMEDIATE", input$ncut, input$inclcut, rv$file_label, build_model_label(), rv$df_cal, rv$outcome_var, assumptions)
+  })
+  
+  # Summary
+  output$solutionSummary <- renderDT({
+    req(rv$df_cal, rv$outcome_var)
+    get_cc <- function(sol) { if(is.null(sol)) c(NA,NA) else compute_solution_cov_cons(get_all_configurations(sol), rv$df_cal, rv$outcome_var) }
+    df <- data.frame(Solution = c("Complex", "Parsimonious", "Intermediate"),
+                     Coverage = c(get_cc(rv$sol_complex)[1], get_cc(rv$sol_pars)[1], get_cc(rv$sol_int)[1]),
+                     Consistency = c(get_cc(rv$sol_complex)[2], get_cc(rv$sol_pars)[2], get_cc(rv$sol_int)[2]))
+    datatable(df, options = list(dom = "t")) %>% formatRound(2:3, 6)
+  })
+  
+  output$bestConfigs <- renderDT({
+    req(rv$df_cal, rv$outcome_var)
+    collect <- function(sol, nm) {
+      terms <- get_all_configurations(sol); if(length(terms)==0) return(NULL)
+      ts <- compute_term_stats(terms, rv$df_cal, rv$outcome_var); if(is.null(ts)) return(NULL)
+      ts$Solution <- nm; ts
+    }
+    df <- do.call(rbind, list(collect(rv$sol_complex, "Complex"), collect(rv$sol_pars, "Parsimonious"), collect(rv$sol_int, "Intermediate")))
+    if(is.null(df) || nrow(df)==0) return(NULL)
+    df <- df[order(-df$inclS, -df$covS), ]
+    df$Rank <- seq_len(nrow(df))
+    names(df)[names(df)=="covS"] <- "RawCov"; names(df)[names(df)=="covU"] <- "UniqCov"; names(df)[names(df)=="inclS"] <- "Cons"
+    datatable(df[, c("Rank","Solution","Configuration","RawCov","UniqCov","Cons")], options = list(pageLength = 15)) %>% formatRound(c("RawCov","UniqCov","Cons"), 6)
+  })
+  
+  # Download
+  output$downReport <- downloadHandler(
+    filename = function() paste0("fsqca_", Sys.Date(), ".txt"),
+    content = function(file) {
+      sink(file)
+      cat("fsQCA Report - ", as.character(Sys.Date()), "\n")
+      cat("Generated by fsQCA Analysis Tool\n")
+      cat("Developed by Dr. M.I.M. Riyath\n")
+      cat("Department of Accountancy and Finance\n")
+      cat("South Eastern University of Sri Lanka\n")
+      cat("Email: riyath@seu.ac.lk\n\n")
+      cat(paste(rep("=", 80), collapse = ""), "\n\n")
+      
+      if(!is.null(rv$sol_complex)) format_solution_fsqca(rv$sol_complex, "COMPLEX", input$ncut, input$inclcut, rv$file_label, build_model_label(), rv$df_cal, rv$outcome_var)
+      if(!is.null(rv$sol_pars)) format_solution_fsqca(rv$sol_pars, "PARSIMONIOUS", input$ncut, input$inclcut, rv$file_label, build_model_label(), rv$df_cal, rv$outcome_var)
+      if(!is.null(rv$sol_int)) {
+        assumptions <- paste(sapply(rv$condition_vars, function(c) { v <- rv$dir_exp[[c]]; paste0(c, ": ", if(is.null(v)||v=="pa") "Present or Absent" else if(v=="p") "Present" else "Absent") }), collapse = ", ")
+        format_solution_fsqca(rv$sol_int, "INTERMEDIATE", input$ncut, input$inclcut, rv$file_label, build_model_label(), rv$df_cal, rv$outcome_var, assumptions)
+      }
+      sink()
+    }
+  )
+}
+
+shinyApp(ui = ui, server = server)
